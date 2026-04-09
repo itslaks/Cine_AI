@@ -5,7 +5,7 @@
 🚀 **Live Demo**: [cine-ai-gilt.vercel.app](https://cine-ai-gilt.vercel.app/)
 
 [![Vercel Deployment](https://img.shields.io/badge/Deployed%20on-Vercel-black?style=flat-square&logo=vercel)](https://cine-ai-gilt.vercel.app/)
-[![GitHub License](https://img.shields.io/github/license/itslaks/Cine_AI?style=flat-square&color=gold)](https://github.com/itslaks/Cine_AI/blob/main/LICENSE)
+[![License](https://img.shields.io/badge/license-MIT-gold?style=flat-square)](LICENSE)
 [![Python Version](https://img.shields.io/badge/python-3.10%2B-violet?style=flat-square)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-005850?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
 [![LLM](https://img.shields.io/badge/LLM-Llama--3.1--8B-blue?style=flat-square)](https://groq.com/)
