@@ -2,9 +2,13 @@
 
 ![CineAI Banner](https://images.unsplash.com/photo-1485846234645-a62644f84728?auto=format&fit=crop&q=80&w=1200)
 
+🚀 **Live Demo**: [cine-ai-gilt.vercel.app](https://cine-ai-gilt.vercel.app/)
+
+[![Vercel Deployment](https://img.shields.io/badge/Deployed%20on-Vercel-black?style=flat-square&logo=vercel)](https://cine-ai-gilt.vercel.app/)
 [![GitHub License](https://img.shields.io/github/license/itslaks/Cine_AI?style=flat-square&color=gold)](https://github.com/itslaks/Cine_AI/blob/main/LICENSE)
-[![GitHub Stars](https://img.shields.io/github/stars/itslaks/Cine_AI?style=flat-square&color=teal)](https://github.com/itslaks/Cine_AI/stargazers)
 [![Python Version](https://img.shields.io/badge/python-3.10%2B-violet?style=flat-square)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-005850?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![LLM](https://img.shields.io/badge/LLM-Llama--3.1--8B-blue?style=flat-square)](https://groq.com/)
 
 **CineAI** is a premium, AI-powered movie discovery engine designed for those who don't just watch films—they live them. From underground Tamil masterpieces to Hollywood cult classics, CineAI understands the subtle nuances of your cinematic cravings.
 
@@ -54,16 +58,23 @@ Standard ratings are boring. CineAI uses a **Weighted Sentiment Index (WSI)**:
 Clone the universe and install the logic:
 ```bash
 git clone https://github.com/itslaks/Cine_AI.git
-cd Cine_AI/main
+cd Cine_AI
 pip install -r requirements.txt
 ```
 
-### 2️⃣ Secret Sauce (API Keys)
-Create a `.env` file in the `main` directory:
+### 2️⃣ Secret Sauce (Environment Variables)
+Create a `.env` file in the root directory. You will need the following API keys to power the engine:
+
+| Variable | Source | Description |
+| :--- | :--- | :--- |
+| `GROQ_API_KEY` | [console.groq.com](https://console.groq.com/) | Powers the AI reasoning & recommendations (Llama 3.1). |
+| `TMDB_API_KEY` | [themoviedb.org](https://www.themoviedb.org/settings/api) | Fetches movie posters, trending lists, and OTT platforms. |
+| `OMDB_API_KEY` | [omdbapi.com](https://www.omdbapi.com/apikey.aspx) | Provides full movie metadata and weighted IMDb ratings. |
+
 ```env
-GROQ_API_KEY=your_key
-TMDB_API_KEY=your_key
-OMDB_API_KEY=your_key
+GROQ_API_KEY=your_groq_key_here
+TMDB_API_KEY=your_tmdb_key_here
+OMDB_API_KEY=your_omdb_key_here
 ```
 
 ### 3️⃣ Action!
@@ -75,12 +86,36 @@ Explore the cinematic multiverse at `http://127.0.0.1:8000`.
 
 ---
 
+## ☁️ Deployment
+
+### Vercel (Recommended)
+This project is configured for one-click deployment to Vercel.
+- Uses `vercel.json` for Python runtime configuration.
+- Automatically handles temporary storage via `/tmp` in serverless environments.
+- **Note**: The watchlist is temporary in serverless sessions.
+
+---
+
+## 🛠️ Tech Stack
+- **Backend**: Python 3.10+, FastAPI, Pydantic (Settings & Validations)
+- **Frontend**: HTML5, Vanilla JavaScript, CSS3 (Glassmorphism UI)
+- **LLM**: Groq (Llama-3.1-8b-instant), Ollama (Local Fallback)
+- **Data**: OMDb API (Metadata), TMDb API (Posters & Streaming)
+
+---
+
 ## 🤝 Contribution & Community
 We're building the future of film discovery. Feel free to fork `itslaks/Cine_AI` and submit PRs for new discovery modes or aesthetic upgrades.
 
 - **Architect**: [itslaks](https://github.com/itslaks)
 - **Engine**: ⚡ LLaMA 3.1 
 - **Soul**: 🍿 Cinema Enthusiasts
+- **Live**: [cine-ai-gilt.vercel.app](https://cine-ai-gilt.vercel.app/)
+
+---
+
+## 📜 License
+CineAI is released under the [MIT License](LICENSE).
 
 ---
 

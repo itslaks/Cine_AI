@@ -2015,6 +2015,14 @@ async def llm_status(request: Request):
     }
 
 
+@app.get("/manifest.json")
+async def manifest():
+    manifest_path = Path(__file__).parent / "manifest.json"
+    if manifest_path.exists():
+        return JSONResponse(content=json.loads(manifest_path.read_text(encoding="utf-8")))
+    return JSONResponse(content={"error": "manifest not found"}, status_code=404)
+
+
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
     _enforce_rate_limits(request)
