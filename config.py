@@ -40,22 +40,39 @@ class Settings(BaseSettings):
     rate_limit_ip_window_seconds: int = 60
 
     # Cache
-    cache_dir: str = str(BASE_DIR / "cache")
+    cache_dir: str = ""
     cache_ttl_seconds: int = 3600
-    data_dir: str = str(BASE_DIR / "data")
+    data_dir: str = ""
 
     # Similarity
     similarity_min_threshold: float = 20.0
 
+    def __init__(self, **values):
+        super().__init__(**values)
+        is_vercel = os.environ.get("VERCEL") == "1"
+        if is_vercel:
+            self.cache_dir = "/tmp/cache"
+            self.data_dir = "/tmp/data"
+        else:
+            if not self.cache_dir:
+                self.cache_dir = str(BASE_DIR / "cache")
+            if not self.data_dir:
+                self.data_dir = str(BASE_DIR / "data")
+
 
 PATHS = {
     "base": BASE_DIR,
-    "cache": BASE_DIR / "cache",
-    "data": BASE_DIR / "data",
 }
 
 settings = Settings()
 
-# Ensure directories exist
-Path(settings.cache_dir).mkdir(parents=True, exist_ok=True)
-Path(settings.data_dir).mkdir(parents=True, exist_ok=True)
+# Ensure directories exist (wrapped in try-except for environments with restricted filesystem)
+try:
+    Path(settings.cache_dir).mkdir(parents=True, exist_ok=True)
+    Path(settings.data_dir).mkdir(parents=True, exist_ok=True)
+    PATHS["cache"] = Path(settings.cache_dir)
+    PATHS["data"] = Path(settings.data_dir)
+except Exception:
+    # If this fails, we assume we're in a highly restricted environment
+    # and will rely on the app logic to handle missing directories if possible
+    pass
