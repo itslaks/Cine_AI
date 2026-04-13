@@ -17,7 +17,6 @@ Features:
 from __future__ import annotations
 
 import asyncio
-import html
 import hashlib
 import json
 import logging
@@ -47,6 +46,9 @@ logging.basicConfig(
     format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
 )
 logger = logging.getLogger("cineai")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("groq._base_client").setLevel(logging.WARNING)
 logger.info("🚀 CineAI Engine is warming up...")
 
 
@@ -196,8 +198,8 @@ class WatchlistResponse(BaseModel):
 def _safe_text(value: Optional[str], limit: int = 397) -> Optional[str]:
     if value is None:
         return None
-    text = str(value).strip()[:limit]
-    return html.escape(text, quote=True)
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", str(value))
+    return text.strip()[:limit]
 
 
 def _coerce_review(rv) -> Optional["ReviewItem"]:
@@ -470,14 +472,38 @@ class MediaClient:
     TMDB_PERSON = "https://api.themoviedb.org/3/search/person"
 
     def __init__(self):
-        self._client = httpx.AsyncClient(timeout=12, follow_redirects=True)
+        self._clients: dict[int, httpx.AsyncClient] = {}
+        self._semaphores: dict[int, asyncio.Semaphore] = {}
+        self._lock = threading.Lock()
+
+    def _loop_resources(self) -> tuple[httpx.AsyncClient, asyncio.Semaphore]:
+        loop_key = id(asyncio.get_running_loop())
+        with self._lock:
+            client = self._clients.get(loop_key)
+            if client is None or client.is_closed:
+                limits = httpx.Limits(
+                    max_connections=max(settings.external_api_concurrency, 1),
+                    max_keepalive_connections=max(settings.external_api_concurrency // 2, 1),
+                )
+                client = httpx.AsyncClient(timeout=12, follow_redirects=True, limits=limits)
+                self._clients[loop_key] = client
+            sem = self._semaphores.get(loop_key)
+            if sem is None:
+                sem = asyncio.Semaphore(max(settings.external_api_concurrency, 1))
+                self._semaphores[loop_key] = sem
+            return client, sem
+
+    async def _get(self, url: str, params: Optional[dict] = None) -> httpx.Response:
+        client, sem = self._loop_resources()
+        async with sem:
+            return await client.get(url, params=params)
 
     async def _omdb_fetch(self, params: dict) -> dict:
         if not settings.omdb_api_key:
             return {}
         try:
             params["apikey"] = settings.omdb_api_key
-            r = await self._client.get(self.OMDB, params=params)
+            r = await self._get(self.OMDB, params=params)
             r.raise_for_status()
             d = r.json()
             return d if d.get("Response") == "True" else {}
@@ -512,7 +538,7 @@ class MediaClient:
             params: dict[str, Any] = {"api_key": settings.tmdb_api_key, "query": title}
             if year:
                 params["year"] = year
-            r = await self._client.get(self.TMDB_SEARCH, params=params)
+            r = await self._get(self.TMDB_SEARCH, params=params)
             for item in r.json().get("results", [])[:3]:
                 path = item.get("poster_path")
                 if path:
@@ -525,7 +551,7 @@ class MediaClient:
         if not settings.tmdb_api_key or not imdb_id:
             return None, None
         try:
-            r = await self._client.get(
+            r = await self._get(
                 f"{self.TMDB_FIND}/{imdb_id}",
                 params={"api_key": settings.tmdb_api_key, "external_source": "imdb_id"},
             )
@@ -545,7 +571,7 @@ class MediaClient:
         if not media_type or not tmdb_id:
             return [], []
         try:
-            r = await self._client.get(
+            r = await self._get(
                 f"https://api.themoviedb.org/3/{media_type}/{tmdb_id}/watch/providers",
                 params={"api_key": settings.tmdb_api_key},
             )
@@ -571,7 +597,7 @@ class MediaClient:
         if not media_type or not tmdb_id:
             return [], []
         try:
-            r = await self._client.get(
+            r = await self._get(
                 f"https://api.themoviedb.org/3/{media_type}/{tmdb_id}/reviews",
                 params={"api_key": settings.tmdb_api_key, "page": 1},
             )
@@ -607,11 +633,11 @@ class MediaClient:
             return {"movies": [], "series": []}
         try:
             movies_r, series_r = await asyncio.gather(
-                self._client.get(
+                self._get(
                     f"https://api.themoviedb.org/3/movie/now_playing",
                     params={"api_key": settings.tmdb_api_key, "region": "IN"},
                 ),
-                self._client.get(
+                self._get(
                     f"https://api.themoviedb.org/3/tv/on_the_air",
                     params={"api_key": settings.tmdb_api_key},
                 ),
@@ -645,7 +671,7 @@ class MediaClient:
         if not settings.tmdb_api_key:
             return None
         try:
-            r = await self._client.get(
+            r = await self._get(
                 self.TMDB_PERSON,
                 params={"api_key": settings.tmdb_api_key, "query": name},
             )
@@ -657,11 +683,11 @@ class MediaClient:
             if not pid:
                 return None
             details_r, credits_r = await asyncio.gather(
-                self._client.get(
+                self._get(
                     f"https://api.themoviedb.org/3/person/{pid}",
                     params={"api_key": settings.tmdb_api_key},
                 ),
-                self._client.get(
+                self._get(
                     f"https://api.themoviedb.org/3/person/{pid}/combined_credits",
                     params={"api_key": settings.tmdb_api_key},
                 ),
@@ -835,22 +861,30 @@ class FileCache:
         self.dir = Path(cache_dir)
         self.dir.mkdir(parents=True, exist_ok=True)
         self.ttl = ttl
+        self._lock = threading.Lock()
 
     def _key(self, raw: str) -> Path:
         return self.dir / f"{hashlib.md5(raw.encode()).hexdigest()}.json"
 
-    def get(self, raw: str) -> Any:
+    def get(self, raw: str, ttl: Optional[int] = None) -> Any:
         p = self._key(raw)
-        if p.exists() and (time.time() - p.stat().st_mtime) < self.ttl:
+        cache_ttl = self.ttl if ttl is None else ttl
+        if p.exists() and (time.time() - p.stat().st_mtime) < cache_ttl:
             try:
-                return json.loads(p.read_text())
+                with self._lock:
+                    return json.loads(p.read_text(encoding="utf-8"))
             except Exception:
                 pass
         return None
 
     def set(self, raw: str, value: Any) -> None:
         try:
-            self._key(raw).write_text(json.dumps(value, default=str))
+            p = self._key(raw)
+            tmp = p.with_name(f"{p.name}.{threading.get_ident()}.tmp")
+            payload = json.dumps(value, default=str, ensure_ascii=False)
+            with self._lock:
+                tmp.write_text(payload, encoding="utf-8")
+                tmp.replace(p)
         except Exception:
             pass
 
@@ -860,6 +894,49 @@ class FileCache:
 # ══════════════════════════════════════════════════════════════════════════
 
 class CineAIEngine:
+    LANGUAGE_ALIASES = {
+        "tamil": {"tamil", "kollywood"},
+        "hindi": {"hindi", "bollywood"},
+        "telugu": {"telugu", "tollywood"},
+        "malayalam": {"malayalam", "mollywood"},
+        "kannada": {"kannada", "sandalwood"},
+        "korean": {"korean", "k-drama", "kdrama"},
+        "japanese": {"japanese", "anime"},
+        "french": {"french"},
+        "spanish": {"spanish"},
+        "english": {"english", "hollywood"},
+    }
+    GENRE_ALIASES = {
+        "comedy": {"comedy", "funny", "humor", "humour", "laugh", "lighthearted"},
+        "romance": {"romance", "romantic", "love", "relationship"},
+        "thriller": {"thriller", "suspense", "mystery", "detective"},
+        "horror": {"horror", "scary", "ghost", "haunted"},
+        "action": {"action", "fight", "mass", "blockbuster"},
+        "drama": {"drama", "emotional", "family", "sad"},
+        "sci-fi": {"sci-fi", "scifi", "science fiction", "space", "mind-bending"},
+        "crime": {"crime", "gangster", "mafia", "heist"},
+        "animation": {"animation", "animated", "anime"},
+    }
+    CURATED_SEEDS = {
+        ("tamil", "comedy"): [
+            "Panchatanthiram", "Michael Madana Kama Rajan", "Vasool Raja MBBS",
+            "Soodhu Kavvum", "Boss Engira Bhaskaran", "Kalakalappu",
+            "Varuthapadatha Valibar Sangam", "Aandavan Kattalai",
+        ],
+        ("tamil", "romance"): [
+            "Alaipayuthey", "96", "OK Kanmani", "Vinnaithaandi Varuvaayaa",
+            "Minnale", "Kandukondain Kandukondain", "Autograph", "Mouna Ragam",
+        ],
+        ("malayalam", "thriller"): [
+            "Drishyam", "Anjaam Pathiraa", "Mumbai Police", "Memories",
+            "Ela Veezha Poonchira", "Joseph", "Kishkindha Kaandam",
+        ],
+        ("hindi", "romance"): [
+            "Dilwale Dulhania Le Jayenge", "Jab We Met", "Kal Ho Naa Ho",
+            "Dil Chahta Hai", "Yeh Jawaani Hai Deewani", "Barfi!",
+        ],
+    }
+
     def __init__(self):
         self.media = MediaClient()
         self.cache = FileCache(settings.cache_dir, ttl=settings.cache_ttl_seconds)
@@ -867,14 +944,109 @@ class CineAIEngine:
     def _parse_json(self, text: str, fallback: Any = None) -> Any:
         text = re.sub(r"^```(?:json)?\s*", "", text.strip())
         text = re.sub(r"\s*```$", "", text)
-        for pattern in (r"\[[\s\S]*\]", r"\{[\s\S]*\}"):
+        try:
+            return json.loads(text)
+        except Exception:
+            pass
+        obj_pos = text.find("{") if "{" in text else -1
+        arr_pos = text.find("[") if "[" in text else -1
+        patterns = []
+        if obj_pos >= 0 and (arr_pos < 0 or obj_pos < arr_pos):
+            patterns = [r"\{[\s\S]*\}", r"\[[\s\S]*\]"]
+        else:
+            patterns = [r"\[[\s\S]*\]", r"\{[\s\S]*\}"]
+        for pattern in patterns:
             m = re.search(pattern, text)
-            if m:
-                try:
-                    return json.loads(m.group())
-                except Exception:
-                    pass
+            if not m:
+                continue
+            try:
+                return json.loads(m.group())
+            except Exception:
+                pass
         return fallback
+
+    def _infer_language(self, req: RecommendationRequest, intent_data: Optional[dict] = None) -> str:
+        hay = " ".join([
+            req.language or "",
+            req.preference or "",
+            req.genres or "",
+            str((intent_data or {}).get("language") or ""),
+        ]).lower()
+        for language, aliases in self.LANGUAGE_ALIASES.items():
+            if any(re.search(rf"\b{re.escape(alias)}\b", hay) for alias in aliases):
+                return language
+        return ""
+
+    def _infer_genres(self, req: RecommendationRequest, intent_data: Optional[dict] = None) -> set[str]:
+        hay = " ".join([
+            req.preference or "",
+            req.genres or "",
+            " ".join((intent_data or {}).get("genres", []) or []),
+            " ".join((intent_data or {}).get("moods", []) or []),
+            " ".join((intent_data or {}).get("themes", []) or []),
+        ]).lower()
+        wanted: set[str] = set()
+        for genre, aliases in self.GENRE_ALIASES.items():
+            if any(re.search(rf"\b{re.escape(alias)}\b", hay) for alias in aliases):
+                wanted.add(genre)
+        return wanted
+
+    def _language_matches(self, language: str, item: dict) -> bool:
+        if not language:
+            return False
+        item_lang = (item.get("language") or "").lower()
+        aliases = self.LANGUAGE_ALIASES.get(language, {language})
+        return any(alias in item_lang for alias in aliases | {language})
+
+    def _tighten_candidate_pool(
+        self,
+        req: RecommendationRequest,
+        intent_data: dict,
+        candidates: list[dict],
+        target_count: int,
+    ) -> list[dict]:
+        language = self._infer_language(req, intent_data)
+        wanted_genres = self._infer_genres(req, intent_data)
+
+        def genre_match(item: dict) -> bool:
+            if not wanted_genres:
+                return True
+            item_genres = {g.strip().lower() for g in item.get("genres", [])}
+            return bool(wanted_genres & item_genres)
+
+        def language_match(item: dict) -> bool:
+            return not language or self._language_matches(language, item)
+
+        strict = [item for item in candidates if language_match(item) and genre_match(item)]
+        if len(strict) >= target_count:
+            return strict
+        language_only = [item for item in candidates if language_match(item)]
+        if language and len(language_only) >= target_count:
+            return language_only
+        genre_only = [item for item in candidates if genre_match(item)]
+        if wanted_genres and len(genre_only) >= target_count:
+            return genre_only
+        return candidates
+
+    def _curated_seed_titles(self, req: RecommendationRequest, intent_data: Optional[dict] = None) -> list[str]:
+        language = self._infer_language(req, intent_data)
+        genres = self._infer_genres(req, intent_data)
+        titles: list[str] = []
+        for genre in genres:
+            titles.extend(self.CURATED_SEEDS.get((language, genre), []))
+        return titles
+
+    async def _gather_limited(self, coros: list, limit: Optional[int] = None) -> list:
+        sem = asyncio.Semaphore(max(limit or settings.enrich_concurrency, 1))
+
+        async def run(coro):
+            async with sem:
+                try:
+                    return await coro
+                except Exception as exc:
+                    return exc
+
+        return await asyncio.gather(*(run(coro) for coro in coros))
 
     def _compact_candidates(self, enriched: list[dict]) -> str:
         lines = []
@@ -973,22 +1145,35 @@ class CineAIEngine:
         token_overlap = len(expanded & hay_tokens) / max(1, len(expanded))
 
         item_genres = {g.strip().lower() for g in item.get("genres", [])}
-        wanted = {g.strip().lower() for g in (intent_data.get("genres", []) or [])}
+        wanted = self._infer_genres(req, intent_data)
+        wanted.update({g.strip().lower() for g in (intent_data.get("genres", []) or []) if str(g).strip()})
         wanted.update({g.strip().lower() for g in (req.genres or "").split(",") if g.strip()})
         genre_overlap = len(wanted & item_genres) / max(1, len(wanted)) if wanted else 0.0
 
         romance_trigger = any(t in expanded for t in ("love", "romance", "romantic", "relationship", "couple"))
         romance_boost = 0.20 if romance_trigger and "romance" in item_genres else 0.0
 
-        # Language match boost
-        lang_boost = 0.0
-        req_lang = (req.language or intent_data.get("language") or "").lower()
-        item_lang = (item.get("language") or "").lower()
-        if req_lang and req_lang in item_lang:
-            lang_boost = 0.25
+        language = self._infer_language(req, intent_data)
+        lang_score = 1.0 if self._language_matches(language, item) else 0.0
+        actor_score = 0.0
+        actor = (req.hero_actor or intent_data.get("hero_actor") or "").strip().lower()
+        if actor:
+            credits = " ".join(item.get("cast", []) or []).lower()
+            director = (item.get("director") or "").lower()
+            actor_score = 1.0 if actor in credits or actor in director else 0.0
 
-        raw = (token_overlap * 0.35) + (genre_overlap * 0.35) + romance_boost + lang_boost
-        return round(min(1.0, raw) * 100, 1)
+        raw = (
+            (token_overlap * 0.25)
+            + (genre_overlap * 0.35)
+            + (lang_score * 0.25)
+            + (actor_score * 0.15)
+            + romance_boost
+        )
+        if language and not lang_score:
+            raw -= 0.18
+        if wanted and not genre_overlap:
+            raw -= 0.12
+        return round(max(0.0, min(1.0, raw)) * 100, 1)
 
     def _extract_similarity_anchor(self, text: str) -> Optional[str]:
         q = (text or "").strip()
@@ -1084,9 +1269,8 @@ class CineAIEngine:
             seeds = await self.media.search(f"{anchor.get('title', '')} movie")
             similar_titles.extend([x.get("Title", "") for x in seeds[:8] if x.get("Title")])
 
-        raw_results = await asyncio.gather(
-            *[self.media.enrich(t) for t in similar_titles[:20]],
-            return_exceptions=True,
+        raw_results = await self._gather_limited(
+            [self.media.enrich(t) for t in similar_titles[:20]]
         )
         enriched: list[dict] = []
         seen: set[str] = set()
@@ -1163,7 +1347,7 @@ class CineAIEngine:
         )
 
     async def _seed_titles(
-        self, req: RecommendationRequest, llm_titles: list[str]
+        self, req: RecommendationRequest, llm_titles: list[str], intent_data: Optional[dict] = None
     ) -> list[tuple[str, Optional[str]]]:
         seeds: list[tuple[str, Optional[str]]] = []
         seen_titles: set[str] = set()
@@ -1182,19 +1366,26 @@ class CineAIEngine:
                 seen_ids.add(iid)
             seeds.append((t, iid or None))
 
+        for t in self._curated_seed_titles(req, intent_data)[:12]:
+            add(t)
+
         for t in llm_titles[:14]:
             add(t)
 
         # Build broader search queries including language context
         search_queries = []
+        inferred_language = self._infer_language(req, intent_data)
+        inferred_genres = self._infer_genres(req, intent_data)
         if req.preference:
             search_queries.append(req.preference[:120])
         if req.hero_actor:
             search_queries.append(req.hero_actor[:80])
         if req.genres:
             search_queries.append(req.genres[:80])
-        if req.language:
-            search_queries.append(f"{req.language} {req.genres or req.preference[:40]}")
+        if inferred_language:
+            search_queries.append(f"{inferred_language} {req.genres or req.preference[:40]}")
+            for genre in list(inferred_genres)[:2]:
+                search_queries.append(f"{inferred_language} {genre} movie")
 
         for q in search_queries:
             if not q:
@@ -1217,15 +1408,16 @@ class CineAIEngine:
                 {"actor_name": actor_name[:100]},
             )
             actor_info = self._parse_json(raw, {})
+            if not isinstance(actor_info, dict):
+                actor_info = {}
         except Exception:
             actor_info = {}
             llm_used = "none"
 
         bio = (person_data or {}).get("bio") or actor_info.get("bio", "")
         known_for_titles = (person_data or {}).get("known_for") or actor_info.get("best_films", [])
-        raw_results = await asyncio.gather(
-            *[self.media.enrich(t) for t in known_for_titles[:8]],
-            return_exceptions=True,
+        raw_results = await self._gather_limited(
+            [self.media.enrich(t) for t in known_for_titles[:8]]
         )
         enriched = []
         seen_iids: set[str] = set()
@@ -1301,14 +1493,22 @@ class CineAIEngine:
             char_data = {}
             llm_used = "none"
 
-        similar_chars = char_data.get("similar_characters", [])
+        if isinstance(char_data, list):
+            char_data = {"similar_characters": char_data, "summary": f"Characters similar to {req.preference}"}
+        elif not isinstance(char_data, dict):
+            char_data = {}
+
+        similar_chars = [
+            item for item in char_data.get("similar_characters", [])
+            if isinstance(item, dict)
+        ]
         summary = char_data.get("summary", f"Characters similar to {req.preference}")
         tasks = [
             (sc, self.media.enrich(sc.get("movie", "")))
             for sc in similar_chars[:8]
             if sc.get("movie")
         ]
-        results = await asyncio.gather(*[t[1] for t in tasks], return_exceptions=True)
+        results = await self._gather_limited([t[1] for t in tasks])
         enriched_cards = []
         for i, (task_pair, result) in enumerate(zip(tasks, results)):
             sc, _ = task_pair
@@ -1460,6 +1660,8 @@ class CineAIEngine:
             f":{req.hero_actor}:{req.content_types}:{req.language}"
         )
         intent_data = self.cache.get(cache_key)
+        if intent_data is not None and not isinstance(intent_data, dict):
+            intent_data = None
 
         if intent_data is None:
             try:
@@ -1476,6 +1678,8 @@ class CineAIEngine:
                     },
                 )
                 intent_data = self._parse_json(raw, {})
+                if not isinstance(intent_data, dict):
+                    intent_data = {}
                 self.cache.set(cache_key, intent_data)
             except Exception as exc:
                 logger.error(f"Intent extraction failed: {exc}")
@@ -1505,10 +1709,9 @@ class CineAIEngine:
                 self.cache.set(ck, result)
             return result
 
-        seed_pairs = await self._seed_titles(req, suggested_titles)
-        raw_results = await asyncio.gather(
-            *[enrich_cached(t, i) for t, i in seed_pairs],
-            return_exceptions=True,
+        seed_pairs = await self._seed_titles(req, suggested_titles, intent_data)
+        raw_results = await self._gather_limited(
+            [enrich_cached(t, i) for t, i in seed_pairs]
         )
 
         enriched: list[dict] = []
@@ -1530,6 +1733,7 @@ class CineAIEngine:
             enriched.append(item)
 
         enriched = [item for item in enriched if self._passes_filters(req, item)]
+        enriched = self._tighten_candidate_pool(req, intent_data, enriched, req.count)
         for item in enriched:
             rel = self._relevance_score(req, intent_data, item)
             quality = item.get("weighted_score") or 0.0
@@ -1788,23 +1992,32 @@ def get_engine() -> CineAIEngine:
     return _engine
 
 
-_WATCHLIST_FILE = Path(settings.data_dir) / "watchlist.json"
+_WATCHLIST_LOCK = threading.Lock()
+_WATCHLIST_ID_RE = re.compile(r"[^a-zA-Z0-9_-]")
 
 
-def _read_watchlist() -> list[dict]:
-    if not _WATCHLIST_FILE.exists():
+def _watchlist_file(request: Request) -> Path:
+    raw_client_id = request.headers.get("x-cineai-client", "").strip()
+    client_id = _WATCHLIST_ID_RE.sub("", raw_client_id)[:64] or "default"
+    return Path(settings.data_dir) / f"watchlist_{client_id}.json"
+
+
+def _read_watchlist(path: Path) -> list[dict]:
+    if not path.exists():
         return []
     try:
-        return json.loads(_WATCHLIST_FILE.read_text(encoding="utf-8"))
+        with _WATCHLIST_LOCK:
+            return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return []
 
 
-def _write_watchlist(items: list[dict]) -> None:
-    _WATCHLIST_FILE.parent.mkdir(parents=True, exist_ok=True)
-    _WATCHLIST_FILE.write_text(
-        json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+def _write_watchlist(path: Path, items: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{threading.get_ident()}.tmp")
+    with _WATCHLIST_LOCK:
+        tmp.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -1876,7 +2089,7 @@ async def compare_movies(payload: CompareRequest, request: Request):
 @app.get("/api/watchlist", response_model=WatchlistResponse)
 async def get_watchlist(request: Request):
     _enforce_rate_limits(request)
-    items = _read_watchlist()
+    items = _read_watchlist(_watchlist_file(request))
     return WatchlistResponse(items=[WatchlistItem(**i) for i in items], alerts=[])
 
 
@@ -1887,7 +2100,8 @@ async def add_watchlist(payload: WatchlistAddRequest, request: Request):
     data = await engine.media.enrich(payload.title)
     if not data:
         raise HTTPException(status_code=404, detail="Title not found.")
-    items = _read_watchlist()
+    watchlist_file = _watchlist_file(request)
+    items = _read_watchlist(watchlist_file)
     iid = data.get("imdb_id") or payload.title.lower()
     if any((x.get("imdb_id") or x.get("title", "").lower()) == iid for x in items):
         return WatchlistResponse(
@@ -1901,7 +2115,7 @@ async def add_watchlist(payload: WatchlistAddRequest, request: Request):
         "new_platforms_in": [],
         "last_checked_at": datetime.utcnow().isoformat() + "Z",
     })
-    _write_watchlist(items)
+    _write_watchlist(watchlist_file, items)
     return WatchlistResponse(
         items=[WatchlistItem(**i) for i in items], alerts=["Added to watchlist! ✓"]
     )
@@ -1910,11 +2124,12 @@ async def add_watchlist(payload: WatchlistAddRequest, request: Request):
 @app.post("/api/watchlist/remove")
 async def remove_watchlist(payload: WatchlistAddRequest, request: Request):
     _enforce_rate_limits(request)
-    items = _read_watchlist()
+    watchlist_file = _watchlist_file(request)
+    items = _read_watchlist(watchlist_file)
     before = len(items)
     q = payload.title.strip().lower()
     items = [i for i in items if i.get("title", "").strip().lower() != q]
-    _write_watchlist(items)
+    _write_watchlist(watchlist_file, items)
     return {"status": "success", "removed": before - len(items)}
 
 
@@ -1922,7 +2137,8 @@ async def remove_watchlist(payload: WatchlistAddRequest, request: Request):
 async def check_watchlist_changes(request: Request):
     _enforce_rate_limits(request)
     engine = get_engine()
-    items = _read_watchlist()
+    watchlist_file = _watchlist_file(request)
+    items = _read_watchlist(watchlist_file)
     alerts: list[str] = []
     updated: list[dict] = []
     for item in items:
@@ -1944,7 +2160,7 @@ async def check_watchlist_changes(request: Request):
             "new_platforms_in": newly_added,
             "last_checked_at": datetime.utcnow().isoformat() + "Z",
         })
-    _write_watchlist(updated)
+    _write_watchlist(watchlist_file, updated)
     return WatchlistResponse(
         items=[WatchlistItem(**i) for i in updated], alerts=alerts
     )
@@ -1954,7 +2170,18 @@ async def check_watchlist_changes(request: Request):
 async def recommend(req: RecommendationRequest, request: Request):
     _enforce_rate_limits(request)
     try:
-        response = await get_engine().recommend(req)
+        engine = get_engine()
+        response_cache_key = "response:v2:" + hashlib.md5(
+            json.dumps(req.model_dump(mode="json"), sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        cached_response = engine.cache.get(
+            response_cache_key, ttl=settings.recommendation_cache_ttl_seconds
+        )
+        if cached_response is not None:
+            response = RecommendationResponse(**cached_response)
+        else:
+            response = await engine.recommend(req)
+            engine.cache.set(response_cache_key, response.model_dump(mode="json"))
         for card in response.recommendations:
             card.title = _safe_text(card.title, 140) or ""
             card.overview = _safe_text(card.overview, 500)

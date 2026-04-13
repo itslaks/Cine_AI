@@ -38,10 +38,13 @@ class Settings(BaseSettings):
     max_input_chars: int = 500
     rate_limit_ip_max_requests: int = 30
     rate_limit_ip_window_seconds: int = 60
+    external_api_concurrency: int = 24
+    enrich_concurrency: int = 8
 
     # Cache
     cache_dir: str = ""
     cache_ttl_seconds: int = 3600
+    recommendation_cache_ttl_seconds: int = 300
     data_dir: str = ""
 
     # Similarity
