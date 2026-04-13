@@ -470,6 +470,7 @@ class MediaClient:
     TMDB_FIND = "https://api.themoviedb.org/3/find"
     TMDB_TRENDING = "https://api.themoviedb.org/3/trending"
     TMDB_PERSON = "https://api.themoviedb.org/3/search/person"
+    TMDB_MOVIE = "https://api.themoviedb.org/3/movie"
 
     def __init__(self):
         self._clients: dict[int, httpx.AsyncClient] = {}
@@ -563,6 +564,19 @@ class MediaClient:
         except Exception:
             pass
         return None, None
+
+    async def _tmdb_movie_imdb_id(self, tmdb_id: Optional[int]) -> Optional[str]:
+        if not settings.tmdb_api_key or not tmdb_id:
+            return None
+        try:
+            r = await self._get(
+                f"{self.TMDB_MOVIE}/{tmdb_id}/external_ids",
+                params={"api_key": settings.tmdb_api_key},
+            )
+            imdb_id = r.json().get("imdb_id")
+            return imdb_id if imdb_id else None
+        except Exception:
+            return None
 
     async def watch_provider_payload_in(self, imdb_id: Optional[str]) -> tuple[list[str], list[dict[str, str]]]:
         if not imdb_id or not settings.tmdb_api_key:
@@ -688,26 +702,43 @@ class MediaClient:
                     params={"api_key": settings.tmdb_api_key},
                 ),
                 self._get(
-                    f"https://api.themoviedb.org/3/person/{pid}/combined_credits",
+                    f"https://api.themoviedb.org/3/person/{pid}/movie_credits",
                     params={"api_key": settings.tmdb_api_key},
                 ),
             )
             details = details_r.json()
             credits = credits_r.json()
-            known_for = []
+            movie_credits = []
             for c in sorted(
                 credits.get("cast", []),
-                key=lambda x: x.get("popularity", 0),
+                key=lambda x: (x.get("popularity", 0), x.get("vote_count", 0)),
                 reverse=True,
-            )[:10]:
+            ):
                 title = c.get("title") or c.get("name", "")
-                if title:
-                    known_for.append(title)
+                character = (c.get("character") or "").strip()
+                release_year = str(c.get("release_date") or "")[:4]
+                if not title or not c.get("id"):
+                    continue
+                if character and re.search(r"\b(self|archive footage|cameo)\b", character, re.IGNORECASE):
+                    continue
+                if release_year and not release_year.isdigit():
+                    release_year = ""
+                movie_credits.append({
+                    "title": title,
+                    "tmdb_id": c.get("id"),
+                    "year": int(release_year) if release_year.isdigit() else None,
+                    "character": character,
+                    "popularity": c.get("popularity", 0),
+                    "vote_count": c.get("vote_count", 0),
+                })
+                if len(movie_credits) >= 16:
+                    break
             profile_path = person.get("profile_path") or details.get("profile_path")
             return {
                 "name": person.get("name", name),
                 "bio": (details.get("biography") or "")[:400],
-                "known_for": known_for[:6],
+                "known_for": [c["title"] for c in movie_credits[:6]],
+                "movie_credits": movie_credits,
                 "profile_img": f"{self.TMDB_IMG}{profile_path}" if profile_path else None,
                 "birthday": details.get("birthday"),
                 "place_of_birth": details.get("place_of_birth"),
@@ -1415,10 +1446,31 @@ class CineAIEngine:
             llm_used = "none"
 
         bio = (person_data or {}).get("bio") or actor_info.get("bio", "")
+        movie_credits = (person_data or {}).get("movie_credits", [])
         known_for_titles = (person_data or {}).get("known_for") or actor_info.get("best_films", [])
-        raw_results = await self._gather_limited(
-            [self.media.enrich(t) for t in known_for_titles[:8]]
-        )
+
+        async def enrich_actor_credit(credit: dict) -> Optional[dict]:
+            tmdb_id = credit.get("tmdb_id")
+            imdb_id = await self.media._tmdb_movie_imdb_id(tmdb_id)
+            result = (
+                await self.media.enrich_by_imdb_id(imdb_id, credit.get("title", ""))
+                if imdb_id
+                else await self.media.enrich(credit.get("title", ""))
+            )
+            if result:
+                result["actor_character"] = credit.get("character")
+                result["actor_credit_year"] = credit.get("year")
+            return result
+
+        if movie_credits:
+            raw_results = await self._gather_limited(
+                [enrich_actor_credit(c) for c in movie_credits[: max(req.count * 3, 8)]]
+            )
+        else:
+            raw_results = await self._gather_limited(
+                [self.media.enrich(t) for t in known_for_titles[:8]]
+            )
+
         enriched = []
         seen_iids: set[str] = set()
         for r in raw_results:
@@ -1430,6 +1482,11 @@ class CineAIEngine:
                 continue
             if iid:
                 seen_iids.add(iid)
+            if not movie_credits:
+                cast_text = " ".join(item.get("cast", []) or []).lower()
+                actor_terms = {t for t in re.split(r"[^a-z0-9]+", actor_name.lower()) if len(t) > 2}
+                if actor_terms and not any(term in cast_text for term in actor_terms):
+                    continue
             enriched.append(item)
 
         cards = []
@@ -1458,7 +1515,10 @@ class CineAIEngine:
                 imdb_id=iid or None,
                 imdb_url=f"https://www.imdb.com/title/{iid}/" if iid else None,
                 confidence=0.9,
-                ai_reason=f"Film featuring {actor_name}",
+                ai_reason=(
+                    f"Film featuring {actor_name}"
+                    + (f" as {e.get('actor_character')}" if e.get("actor_character") else "")
+                ),
                 watch_platforms_in=e.get("platforms_in", []),
                 watch_provider_links=e.get("provider_links_in", []),
                 combined_score=e.get("weighted_score"),
@@ -1466,7 +1526,7 @@ class CineAIEngine:
                 critics_reviews=critics_r,
                 audience_reviews=audience_r,
                 actor_bio=bio[:300] if i == 1 else None,
-                known_for=actor_info.get("known_for", [])[:5] if i == 1 else [],
+                known_for=known_for_titles[:5] if i == 1 else [],
                 llm_source=llm_used,
             ))
 
@@ -2171,7 +2231,7 @@ async def recommend(req: RecommendationRequest, request: Request):
     _enforce_rate_limits(request)
     try:
         engine = get_engine()
-        response_cache_key = "response:v2:" + hashlib.md5(
+        response_cache_key = "response:v3:" + hashlib.md5(
             json.dumps(req.model_dump(mode="json"), sort_keys=True).encode("utf-8")
         ).hexdigest()
         cached_response = engine.cache.get(
