@@ -1489,6 +1489,8 @@ function renderResults(data, query) {
   if (!recs.length) {
     meta.style.display = 'none';
     grid.innerHTML = '';
+    document.querySelector('#emptyState .empty-title').textContent = 'NO MATCHES FOUND';
+    document.querySelector('#emptyState .empty-sub').textContent = data.query_analysis || `Try a more specific character or movie reference for "${query}".`;
     document.getElementById('emptyState').classList.add('show');
     return;
   }
@@ -1757,6 +1759,8 @@ function showLoading() {
   document.getElementById('resultsGrid').innerHTML = '';
   document.getElementById('resultsMeta').style.display = 'none';
   document.getElementById('emptyState').classList.remove('show');
+  document.querySelector('#emptyState .empty-title').textContent = 'LIGHTS. CAMERA. SEARCH.';
+  document.querySelector('#emptyState .empty-sub').textContent = "Tell us what kind of film experience you're after — we'll handle the rest.";
   document.getElementById('trendingSection').style.display = 'none';
 }
 

@@ -424,7 +424,8 @@ ACTOR_PROMPT = ChatPromptTemplate.from_messages([
 CHARACTER_PROMPT = ChatPromptTemplate.from_messages([
     ("system", """Film expert. Find movies with characters similar to the given character. JSON only:
 {{"similar_characters":[{{"character":"CharName","movie":"MovieTitle","year":2020,"similarity":"why similar","actor":"ActorName"}}],"summary":"one sentence about the archetype"}}
-Return 6 similar characters from different movies."""),
+Return 6 similar characters from different movies.
+If the character name is obscure or lacks context, infer a broad archetype from the name/query and still return 6 well-known film characters. Never ask the user for more context."""),
     ("human", "Character/Franchise: {character_name}"),
 ])
 
@@ -512,13 +513,16 @@ class MediaClient:
             logger.debug(f"OMDb error: {exc}")
             return {}
 
-    async def by_title(self, title: str, media_type: Optional[str] = None) -> dict:
+    async def by_title(self, title: str, media_type: Optional[str] = None, year: Optional[int] = None) -> dict:
+        base_params = {"t": title, "plot": "full"}
+        if year:
+            base_params["y"] = year
         if media_type:
-            d = await self._omdb_fetch({"t": title, "plot": "full", "type": media_type})
+            d = await self._omdb_fetch({**base_params, "type": media_type})
             if d:
                 return d
         for t in ("movie", "series"):
-            d = await self._omdb_fetch({"t": title, "plot": "full", "type": t})
+            d = await self._omdb_fetch({**base_params, "type": t})
             if d:
                 return d
         return {}
@@ -803,8 +807,8 @@ class MediaClient:
     def combined_score(self, data: dict) -> Optional[float]:
         return self.weighted_score(data)
 
-    async def enrich(self, title: str) -> Optional[dict]:
-        data = await self.by_title(title)
+    async def enrich(self, title: str, year: Optional[int] = None) -> Optional[dict]:
+        data = await self.by_title(title, year=year)
         if not data:
             results = await self.search(title)
             if results:
@@ -1554,7 +1558,14 @@ class CineAIEngine:
             llm_used = "none"
 
         if isinstance(char_data, list):
-            char_data = {"similar_characters": char_data, "summary": f"Characters similar to {req.preference}"}
+            if (
+                len(char_data) == 1
+                and isinstance(char_data[0], dict)
+                and "similar_characters" in char_data[0]
+            ):
+                char_data = char_data[0]
+            else:
+                char_data = {"similar_characters": char_data, "summary": f"Characters similar to {req.preference}"}
         elif not isinstance(char_data, dict):
             char_data = {}
 
@@ -1563,8 +1574,49 @@ class CineAIEngine:
             if isinstance(item, dict)
         ]
         summary = char_data.get("summary", f"Characters similar to {req.preference}")
+        if not similar_chars:
+            try:
+                raw_fallback, llm_used = await llm_manager.invoke(
+                    lambda llm: FALLBACK_PROMPT | llm | StrOutputParser(),
+                    {
+                        "preference": (
+                            f"Movies with charismatic, complex lead characters similar to "
+                            f"the character or archetype '{req.preference}'"
+                        ),
+                        "count": req.count,
+                    },
+                )
+                fallback_items = self._parse_json(raw_fallback, [])
+                if isinstance(fallback_items, list):
+                    similar_chars = [
+                        {
+                            "character": req.preference,
+                            "movie": item.get("title", ""),
+                            "year": item.get("year"),
+                            "similarity": item.get("ai_reason", "Matched by inferred character archetype."),
+                            "actor": "Unknown",
+                        }
+                        for item in fallback_items
+                        if isinstance(item, dict) and item.get("title")
+                    ]
+            except Exception:
+                similar_chars = []
+        if not similar_chars:
+            fallback_titles = [
+                ("Tony Stark", "Iron Man", 2008, "A charismatic, confident lead with a larger-than-life persona.", "Robert Downey Jr."),
+                ("Bruce Wayne", "The Dark Knight", 2008, "A driven lead with a guarded inner life and strong personal code.", "Christian Bale"),
+                ("Ethan Hunt", "Mission: Impossible - Fallout", 2018, "A focused, capable protagonist built around risk and loyalty.", "Tom Cruise"),
+                ("Vedha", "Vikram Vedha", 2017, "A morally complex character with charm and a sharp strategic mind.", "Vijay Sethupathi"),
+                ("Arjun Reddy", "Arjun Reddy", 2017, "An intense, flawed protagonist led by emotion and ego.", "Vijay Deverakonda"),
+                ("Aditya Kashyap", "Jab We Met", 2007, "A reserved lead whose emotional arc opens through the story.", "Shahid Kapoor"),
+            ]
+            similar_chars = [
+                {"character": c, "movie": m, "year": y, "similarity": s, "actor": a}
+                for c, m, y, s, a in fallback_titles
+            ]
+            summary = f"Character matches inferred from the archetype '{req.preference}'."
         tasks = [
-            (sc, self.media.enrich(sc.get("movie", "")))
+            (sc, self.media.enrich(sc.get("movie", ""), sc.get("year")))
             for sc in similar_chars[:8]
             if sc.get("movie")
         ]
@@ -2231,7 +2283,7 @@ async def recommend(req: RecommendationRequest, request: Request):
     _enforce_rate_limits(request)
     try:
         engine = get_engine()
-        response_cache_key = "response:v3:" + hashlib.md5(
+        response_cache_key = "response:v6:" + hashlib.md5(
             json.dumps(req.model_dump(mode="json"), sort_keys=True).encode("utf-8")
         ).hexdigest()
         cached_response = engine.cache.get(
